@@ -11,6 +11,8 @@ from mcp.server.fastmcp import Context, FastMCP
 
 mcp = FastMCP(
     "KappaML",
+    host=os.environ.get("HOST", "127.0.0.1"),
+    port=int(os.environ.get("PORT", "8000")),
     stateless_http=True,
 )
 
@@ -514,4 +516,4 @@ async def restore_checkpoint(
 # ── Entry point ──────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    mcp.run(transport="streamable-http", host="0.0.0.0", port=8000)
+    mcp.run(transport="streamable-http")

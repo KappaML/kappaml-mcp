@@ -1,8 +1,10 @@
 FROM python:3.12-slim
 
 WORKDIR /app
-COPY . .
+COPY pyproject.toml .
 RUN pip install --no-cache-dir .
+COPY server.py .
 
+ENV HOST=0.0.0.0
 EXPOSE 8000
 CMD ["python", "server.py"]
