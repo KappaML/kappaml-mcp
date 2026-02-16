@@ -3,44 +3,28 @@
 from __future__ import annotations
 
 import os
-from contextlib import asynccontextmanager
 from typing import Any
 
 import httpx
+from kappaml import KappaML, KappaMLError
 from mcp.server.fastmcp import Context, FastMCP
-
-from kappaml_client import KappaMLClient
-
-# ── Lifespan: shared httpx client ────────────────────────────────────────────
-
-
-@asynccontextmanager
-async def lifespan(server: FastMCP):
-    async with httpx.AsyncClient(timeout=30.0) as http_client:
-        yield {"http_client": http_client}
-
 
 mcp = FastMCP(
     "KappaML",
     stateless_http=True,
-    lifespan=lifespan,
 )
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 
-def _get_client(ctx: Context) -> KappaMLClient:
-    """Build a KappaMLClient from the request context.
+def _get_client(ctx: Context) -> KappaML:
+    """Build a KappaML client from the request context.
 
     Auth priority:
       1. Authorization: Bearer <key> header sent by the MCP client
       2. KAPPAML_API_KEY environment variable (single-tenant fallback)
     """
-    http_client: httpx.AsyncClient = ctx.request_context.lifespan_context[
-        "http_client"
-    ]
-
     api_key: str | None = None
     request = ctx.request_context.request
     if request:
@@ -57,7 +41,28 @@ def _get_client(ctx: Context) -> KappaMLClient:
             "or set the KAPPAML_API_KEY environment variable."
         )
 
-    return KappaMLClient(http_client, api_key)
+    return KappaML(api_key=api_key)
+
+
+async def _raw_request(
+    client: KappaML,
+    method: str,
+    path: str,
+    *,
+    json: Any = None,
+    params: dict[str, str] | None = None,
+) -> Any:
+    """Make a raw HTTP request using the SDK's underlying httpx client."""
+    response = await client.client.request(
+        method,
+        f"{client.base_url}{path}",
+        json=json,
+        params=params,
+    )
+    response.raise_for_status()
+    if response.status_code == 204 or not response.content:
+        return {"status": "success"}
+    return response.json()
 
 
 def _error(e: httpx.HTTPStatusError) -> dict:
@@ -69,14 +74,20 @@ def _error(e: httpx.HTTPStatusError) -> dict:
     return {"error": True, "status_code": e.response.status_code, "detail": detail}
 
 
+def _sdk_error(e: KappaMLError) -> dict:
+    """Turn a KappaML SDK error into a structured dict."""
+    return {"error": True, "detail": str(e)}
+
+
 # ── User tools ───────────────────────────────────────────────────────────────
 
 
 @mcp.tool()
 async def get_user_profile(ctx: Context) -> dict:
     """Get the current user's profile."""
+    client = _get_client(ctx)
     try:
-        return await _get_client(ctx).get_profile()
+        return await _raw_request(client, "GET", "/users/me")
     except httpx.HTTPStatusError as e:
         return _error(e)
 
@@ -93,10 +104,14 @@ async def update_user_profile(
         display_name: New display name (1-100 chars).
         phone_number: New phone number in E.164 format.
     """
+    client = _get_client(ctx)
+    body: dict[str, str] = {}
+    if display_name is not None:
+        body["display_name"] = display_name
+    if phone_number is not None:
+        body["phone_number"] = phone_number
     try:
-        return await _get_client(ctx).update_profile(
-            display_name=display_name, phone_number=phone_number
-        )
+        return await _raw_request(client, "PATCH", "/users/me", json=body)
     except httpx.HTTPStatusError as e:
         return _error(e)
 
@@ -111,8 +126,9 @@ async def create_api_key(ctx: Context, name: str) -> dict:
     Args:
         name: A friendly name for the key.
     """
+    client = _get_client(ctx)
     try:
-        return await _get_client(ctx).create_api_key(name)
+        return await _raw_request(client, "POST", "/api-keys", json={"name": name})
     except httpx.HTTPStatusError as e:
         return _error(e)
 
@@ -120,8 +136,9 @@ async def create_api_key(ctx: Context, name: str) -> dict:
 @mcp.tool()
 async def list_api_keys(ctx: Context) -> list | dict:
     """List all API keys for the current user."""
+    client = _get_client(ctx)
     try:
-        return await _get_client(ctx).list_api_keys()
+        return await _raw_request(client, "GET", "/api-keys")
     except httpx.HTTPStatusError as e:
         return _error(e)
 
@@ -133,8 +150,9 @@ async def delete_api_key(ctx: Context, key_id: str) -> dict:
     Args:
         key_id: The ID of the key to delete.
     """
+    client = _get_client(ctx)
     try:
-        return await _get_client(ctx).delete_api_key(key_id)
+        return await _raw_request(client, "DELETE", f"/api-keys/{key_id}")
     except httpx.HTTPStatusError as e:
         return _error(e)
 
@@ -145,8 +163,9 @@ async def delete_api_key(ctx: Context, key_id: str) -> dict:
 @mcp.tool()
 async def list_models(ctx: Context) -> list | dict:
     """List all models for the current user."""
+    client = _get_client(ctx)
     try:
-        return await _get_client(ctx).list_models()
+        return await _raw_request(client, "GET", "/models")
     except httpx.HTTPStatusError as e:
         return _error(e)
 
@@ -159,10 +178,12 @@ async def create_model(ctx: Context, name: str, ml_type: str) -> dict:
         name: Name of the model.
         ml_type: ML task type — 'regression', 'classification', or 'forecasting'.
     """
+    client = _get_client(ctx)
     try:
-        return await _get_client(ctx).create_model(name, ml_type)
-    except httpx.HTTPStatusError as e:
-        return _error(e)
+        model_id = await client.create_model(name, ml_type, wait_for_deployment=False)
+        return {"id": model_id}
+    except KappaMLError as e:
+        return _sdk_error(e)
 
 
 @mcp.tool()
@@ -172,8 +193,9 @@ async def get_model(ctx: Context, model_id: str) -> dict:
     Args:
         model_id: The model ID.
     """
+    client = _get_client(ctx)
     try:
-        return await _get_client(ctx).get_model(model_id)
+        return await _raw_request(client, "GET", f"/models/{model_id}")
     except httpx.HTTPStatusError as e:
         return _error(e)
 
@@ -185,10 +207,12 @@ async def delete_model(ctx: Context, model_id: str) -> dict:
     Args:
         model_id: The model ID to delete.
     """
+    client = _get_client(ctx)
     try:
-        return await _get_client(ctx).delete_model(model_id)
-    except httpx.HTTPStatusError as e:
-        return _error(e)
+        await client.delete_model(model_id)
+        return {"status": "success"}
+    except KappaMLError as e:
+        return _sdk_error(e)
 
 
 # ── Predict tools ────────────────────────────────────────────────────────────
@@ -208,10 +232,18 @@ async def predict(
         features: Feature name-value pairs, e.g. {"temperature": 25.5, "humidity": 65}.
         instance: Optional model instance ID (default "0").
     """
+    client = _get_client(ctx)
     try:
-        return await _get_client(ctx).predict(
-            model_id, features, instance=instance
-        )
+        if instance:
+            params = {"instance": instance}
+            return await _raw_request(
+                client, "POST", f"/models/{model_id}/predict",
+                json={"features": features}, params=params,
+            )
+        result = await client.predict(model_id, features)
+        return {"prediction": result}
+    except KappaMLError as e:
+        return _sdk_error(e)
     except httpx.HTTPStatusError as e:
         return _error(e)
 
@@ -230,9 +262,12 @@ async def predict_batch(
         samples: List of feature dicts, e.g. [{"temp": 25}, {"temp": 30}].
         instance: Optional model instance ID (default "0").
     """
+    client = _get_client(ctx)
+    params = {"instance": instance} if instance else None
     try:
-        return await _get_client(ctx).predict_batch(
-            model_id, samples, instance=instance
+        return await _raw_request(
+            client, "POST", f"/models/{model_id}/predict",
+            json=[{"features": s} for s in samples], params=params,
         )
     except httpx.HTTPStatusError as e:
         return _error(e)
@@ -257,10 +292,17 @@ async def learn(
         target: The target value to learn from.
         instance: Optional model instance ID (default "0").
     """
+    client = _get_client(ctx)
     try:
-        return await _get_client(ctx).learn(
-            model_id, features, target, instance=instance
-        )
+        if instance:
+            params = {"instance": instance}
+            return await _raw_request(
+                client, "POST", f"/models/{model_id}/learn",
+                json={"features": features, "target": target}, params=params,
+            )
+        return await client.learn(model_id, features, target)
+    except KappaMLError as e:
+        return _sdk_error(e)
     except httpx.HTTPStatusError as e:
         return _error(e)
 
@@ -280,9 +322,15 @@ async def learn_batch(
                  e.g. [{"features": {"x": 1}, "target": 2.0}].
         instance: Optional model instance ID (default "0").
     """
+    client = _get_client(ctx)
+    params = {"instance": instance} if instance else None
     try:
-        return await _get_client(ctx).learn_batch(
-            model_id, samples, instance=instance
+        return await _raw_request(
+            client, "POST", f"/models/{model_id}/learn",
+            json=[
+                {"features": s["features"], "target": s["target"]} for s in samples
+            ],
+            params=params,
         )
     except httpx.HTTPStatusError as e:
         return _error(e)
@@ -307,9 +355,15 @@ async def forecast(
         features: Optional list of feature dicts, one per future time step.
         instance: Optional model instance ID (default "0").
     """
+    client = _get_client(ctx)
+    body: dict[str, Any] = {"horizon": horizon}
+    if features is not None:
+        body["features"] = features
+    params = {"instance": instance} if instance else None
     try:
-        return await _get_client(ctx).forecast(
-            model_id, horizon, features=features, instance=instance
+        return await _raw_request(
+            client, "POST", f"/models/{model_id}/forecast",
+            json=body, params=params,
         )
     except httpx.HTTPStatusError as e:
         return _error(e)
@@ -328,8 +382,16 @@ async def get_metrics(
         model_id: The model ID.
         instance: Optional model instance ID (default "0").
     """
+    client = _get_client(ctx)
     try:
-        return await _get_client(ctx).get_metrics(model_id, instance=instance)
+        if instance:
+            return await _raw_request(
+                client, "GET", f"/models/{model_id}/metrics",
+                params={"instance": instance},
+            )
+        return await client.get_metrics(model_id)
+    except KappaMLError as e:
+        return _sdk_error(e)
     except httpx.HTTPStatusError as e:
         return _error(e)
 
@@ -348,9 +410,13 @@ async def get_metrics_history(
         timerange: Time range — e.g. '5m', '1h', '24h', '7d', '30d', '90d', '365d'.
         instance: Optional model instance ID (default "0").
     """
+    client = _get_client(ctx)
+    params: dict[str, str] = {"timerange": timerange}
+    if instance:
+        params["instance"] = instance
     try:
-        return await _get_client(ctx).get_metrics_history(
-            model_id, timerange, instance=instance
+        return await _raw_request(
+            client, "GET", f"/models/{model_id}/metrics/history", params=params,
         )
     except httpx.HTTPStatusError as e:
         return _error(e)
@@ -366,8 +432,9 @@ async def list_checkpoints(ctx: Context, model_id: str) -> dict:
     Args:
         model_id: The model ID.
     """
+    client = _get_client(ctx)
     try:
-        return await _get_client(ctx).list_checkpoints(model_id)
+        return await _raw_request(client, "GET", f"/models/{model_id}/checkpoints")
     except httpx.HTTPStatusError as e:
         return _error(e)
 
@@ -379,8 +446,9 @@ async def create_checkpoint(ctx: Context, model_id: str) -> dict:
     Args:
         model_id: The model ID.
     """
+    client = _get_client(ctx)
     try:
-        return await _get_client(ctx).create_checkpoint(model_id)
+        return await _raw_request(client, "POST", f"/models/{model_id}/checkpoints")
     except httpx.HTTPStatusError as e:
         return _error(e)
 
@@ -395,8 +463,11 @@ async def get_checkpoint(
         model_id: The model ID.
         checkpoint_id: The checkpoint ID.
     """
+    client = _get_client(ctx)
     try:
-        return await _get_client(ctx).get_checkpoint(model_id, checkpoint_id)
+        return await _raw_request(
+            client, "GET", f"/models/{model_id}/checkpoints/{checkpoint_id}",
+        )
     except httpx.HTTPStatusError as e:
         return _error(e)
 
@@ -411,8 +482,11 @@ async def delete_checkpoint(
         model_id: The model ID.
         checkpoint_id: The checkpoint ID.
     """
+    client = _get_client(ctx)
     try:
-        return await _get_client(ctx).delete_checkpoint(model_id, checkpoint_id)
+        return await _raw_request(
+            client, "DELETE", f"/models/{model_id}/checkpoints/{checkpoint_id}",
+        )
     except httpx.HTTPStatusError as e:
         return _error(e)
 
@@ -427,8 +501,12 @@ async def restore_checkpoint(
         model_id: The model ID.
         checkpoint_id: The checkpoint ID to restore.
     """
+    client = _get_client(ctx)
     try:
-        return await _get_client(ctx).restore_checkpoint(model_id, checkpoint_id)
+        return await _raw_request(
+            client, "POST",
+            f"/models/{model_id}/checkpoints/{checkpoint_id}/restore",
+        )
     except httpx.HTTPStatusError as e:
         return _error(e)
 

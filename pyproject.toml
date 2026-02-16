@@ -5,7 +5,7 @@ description = "MCP server exposing the KappaML API as tools for AI assistants"
 requires-python = ">=3.11"
 dependencies = [
     "mcp[cli]>=1.8.0",
-    "httpx>=0.27.0",
+    "kappaml>=1.1.0",
 ]
 
 [build-system]
